@@ -22,12 +22,11 @@ BIN_b64="/usr/bin/base64"
 # The exaustive list of tasks performed by this short program is:
 # - Read up to 2048 bytes of STDIN if available
 # - Determine daemon Host+Port+ApiToken
-# - Determine current_fil_epoch: ( $now_unix - $fil_genesis_unix ) / 30
-# - Get chain tipset at finality ( $current_fil_epoch - 900 )
-# - Determine the supplied storage-provider's Worker address in the finalized state ( $current_fil_epoch - 900 )
-# - Get the drand signature for $current_fil_epoch
-# - Sign the binary string "\x20\x20\x20{96byte-drand-Signature}{optional-up-to-2k-read-from-STDIN}" using the determined worker key
-# - Compose and print the string "${FIL_AUTHHDR} ${current_fil_epoch};f0xxxxx;${hex_encoded_worker_key_signature};${optional-hex-encoded-up-to-2k-read-from-STDIN}"
+# - Get chain tipset at finality ( $FIL_CURRENT_EPOCH - $FIL_FINALITY_EPOCHS )
+# - Determine the supplied storage-provider's Worker address in the finalized state ( $FIL_CURRENT_EPOCH - $FIL_FINALITY_EPOCHS )
+# - Get the drand signature for $FIL_CURRENT_EPOCH
+# - Sign the binary string "\x20\x20\x20{multiple-of-3-bytes-drand-Signature}{optional-up-to-2k-read-from-STDIN}" using the determined worker key
+# - Compose and print the string "${FIL_AUTHHDR} ${FIL_CURRENT_EPOCH};f0xxxxx;${hex_encoded_worker_key_signature};${optional-hex-encoded-up-to-2k-read-from-STDIN}"
 #
 # ( help turning this into a proper spec most welcome )
 #
@@ -37,10 +36,36 @@ set -o pipefail
 
 die() { echo "$@" 1>&2 ; exit 1 ; }
 
+if [[ -z "${FIL_CURRENT_EPOCH:-}" ]] ; then
+  [[ ${BASH_VERSINFO[0]:-0} > 4 ]] || \
+  ( [[ ${BASH_VERSINFO[0]:-0} = 4 ]] && [[ ${BASH_VERSINFO[1]:-0} > 1 ]] ) || \
+  die "Bash version >= 4.2 required to derive a default FIL_CURRENT_EPOCH"
+fi
+
+
+# allow overriding all these defaults from the env
+# https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html#tag_19_06_02
+: ${FIL_WALLTIME_BACKOFF_SECONDS:="25"}  # public endpoints are getting more and more unstable - back off almost an entire epoch
+: ${FIL_FINALITY_EPOCHS:="900"}
+: ${FIL_EPOCH_DURATION_SECONDS:="30"}
+: ${FIL_GENESIS_UNIX:="1598306400"}  # <<<'{"jsonrpc":"2.0","id":1, "method":"Filecoin.ChainGetGenesis", "params":[] }' curl -sH'Content-Type: application/json' -d@/dev/stdin https://api.chain.love/rpc/v0 | jq -r '.result.Blocks[0].Timestamp'
+: ${FIL_CURRENT_EPOCH:="$(( ( "$( printf "%(%s)T" -1 )" - "$FIL_WALLTIME_BACKOFF_SECONDS" - "$FIL_GENESIS_UNIX" ) / "$FIL_EPOCH_DURATION_SECONDS" ))"}
+
+# double check that all numerics are positive integers
+for v in \
+  FIL_WALLTIME_BACKOFF_SECONDS \
+  FIL_FINALITY_EPOCHS \
+  FIL_EPOCH_DURATION_SECONDS \
+  FIL_GENESIS_UNIX \
+  FIL_CURRENT_EPOCH \
+; do [[ "${!v}" =~ ^[0-9]+$ ]] || die "Variable '$v' set to a non-numeric value '${!v}'" ; done
+
+
 [[ "$#" == "1" ]] || die "StorageProviderID ( f0xxxx ) as sole argument required, $# arguments provided"
 [[ "$1" =~ ^f0[0-9]+$ ]] || die "Expecting StorageProviderID ( f0xxxx ) as sole argument, got '$1'"
 
 FIL_SP="$1"
+
 
 # slurp up to 2k of input if nonterminal
 B64_OPTIONAL_PAYLOAD=""
@@ -73,11 +98,9 @@ lotus_apicall() {
   echo "$output"
 }
 
-B64_SPACEPAD="ICAg"  # use this to pefix the random beacon, lest it becomes valid CBOR
-FIL_GENESIS_UNIX="1598306400"
-FIL_CURRENT_EPOCH="$(( ( $( printf "%(%s)T" -1 ) - $FIL_GENESIS_UNIX ) / 30  ))"
+
 FIL_FINALIZED_TIPSET="$(
-  printf '{ "jsonrpc": "2.0", "id":1, "method": "Filecoin.ChainGetTipSetByHeight", "params": [ %d, null ] }' "$(( "$FIL_CURRENT_EPOCH" - 900 ))" \
+  printf '{ "jsonrpc": "2.0", "id":1, "method": "Filecoin.ChainGetTipSetByHeight", "params": [ %d, null ] }' "$(( $FIL_CURRENT_EPOCH - $FIL_FINALITY_EPOCHS ))" \
     | lotus_apicall | "$BIN_jq" -rc .result.Cids
 )"
 FIL_FINALIZED_WORKER_ID="$(
@@ -88,7 +111,8 @@ FIL_CURRENT_DRAND_B64="$(
   printf '{ "jsonrpc": "2.0", "id":1, "method": "Filecoin.BeaconGetEntry", "params": [ %d ] }' "$FIL_CURRENT_EPOCH" \
     | lotus_apicall | "$BIN_jq" -rc .result.Data
 )"
-# the plain append of ${B64_OPTIONAL_PAYLOAD} works because ${FIL_CURRENT_DRAND_B64} is always 96 bytes encoded to 128 chars WITHOUT padding
+# the plain append of ${B64_OPTIONAL_PAYLOAD} works because length of ${FIL_CURRENT_DRAND_B64} is divisible by 3 thus encodes to base64 WITHOUT padding
+B64_SPACEPAD="ICAg" # use "\x20\x20\x20" to pefix the signed payload, lest it becomes valid CBOR ( poor man's domain separation )
 FIL_AUTHSIG="$(
   printf '{ "jsonrpc": "2.0", "id":1, "method": "Filecoin.WalletSign", "params": [ "%s", "%s" ] }' "$FIL_FINALIZED_WORKER_ID" "${B64_SPACEPAD}${FIL_CURRENT_DRAND_B64}${B64_OPTIONAL_PAYLOAD}" \
     | lotus_apicall | "$BIN_jq" -rc '.result.Data'
